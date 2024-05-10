@@ -43,6 +43,8 @@ class MipNerfModel(Model):
 
     config: VanillaModelConfig
 
+    # 类的初始化方法 __init__
+    # 这个方法初始化模型，确认配置中包含必要的边界框碰撞参数。
     def __init__(
         self,
         config: VanillaModelConfig,
@@ -53,6 +55,11 @@ class MipNerfModel(Model):
         super().__init__(config=config, **kwargs)
         assert self.config.collider_params is not None, "mip-NeRF requires collider parameters to be set."
 
+    # populate_modules 方法
+    # 设置模型的各种组件，如位置编码、方向编码、场模型、采样器和渲染器。
+    # 初始化了两种采样器：均匀采样和概率密度函数采样。
+    # 设置了三种渲染器：用于RGB颜色的、累积权重的、和深度值的。
+    # 配置了损失计算和其他度量标准。
     def populate_modules(self):
         """Set the fields and modules"""
         super().populate_modules()
@@ -90,6 +97,7 @@ class MipNerfModel(Model):
         self.ssim = structural_similarity_index_measure
         self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True)
 
+    # 这个方法返回模型参数组，以便于优化时的参数管理。
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {}
         if self.field is None:
@@ -97,6 +105,7 @@ class MipNerfModel(Model):
         param_groups["fields"] = list(self.field.parameters())
         return param_groups
 
+    # 执行渲染流程，包括均匀采样、粗略渲染、基于概率密度函数的采样和精细渲染。输出包括RGB图像、累积图和深度图。
     def get_outputs(self, ray_bundle: RayBundle):
         if self.field is None:
             raise ValueError("populate_fields() must be called before get_outputs")
@@ -141,6 +150,7 @@ class MipNerfModel(Model):
         }
         return outputs
 
+    # 根据渲染结果和真实图像计算损失，分为粗略和精细两个级别。
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
         image = batch["image"].to(self.device)
         pred_coarse, image_coarse = self.renderer_rgb.blend_background_for_loss_computation(
@@ -159,6 +169,7 @@ class MipNerfModel(Model):
         loss_dict = misc.scale_dict(loss_dict, self.config.loss_coefficients)
         return loss_dict
 
+    # 计算图像的质量指标，如峰值信噪比（PSNR）、结构相似性指数（SSIM）和感知图像质量评价（LPIPS）。还返回组合的RGB图、累积图和深度图。
     def get_image_metrics_and_images(
         self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
     ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
