@@ -21,17 +21,172 @@ from typing import Dict, List, Tuple
 
 import torch
 from torch.nn import Parameter
-
-from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.field_components.encodings import NeRFEncoding
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.fields.vanilla_nerf_field import NeRFField
 from nerfstudio.model_components.losses import MSELoss, scale_gradients_by_distance_squared
-from nerfstudio.model_components.ray_samplers import PDFSampler, UniformSampler
-from nerfstudio.model_components.renderers import AccumulationRenderer, DepthRenderer, RGBRenderer
-from nerfstudio.models.base_model import Model
+from nerfstudio.model_components.ray_samplers import PDFSampler, UniformSampler, ProposalNetworkSampler
 from nerfstudio.models.vanilla_nerf import VanillaModelConfig
 from nerfstudio.utils import colormaps, misc
+
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+import numpy as np
+from nerfstudio.model_components import losses
+from nerfstudio.model_components.losses import DepthLossType, depth_loss, depth_ranking_loss
+from nerfstudio.models.nerfacto import NerfactoModel, NerfactoModelConfig
+from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
+from nerfstudio.cameras.rays import RayBundle, RaySamples
+from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
+from nerfstudio.field_components.spatial_distortions import SceneContraction
+from nerfstudio.fields.density_fields import HashMLPDensityField
+from nerfstudio.fields.nerfacto_field import NerfactoField
+from nerfstudio.model_components.losses import (
+    MSELoss,
+    distortion_loss,
+    interlevel_loss,
+    orientation_loss,
+    pred_normal_loss,
+    scale_gradients_by_distance_squared,
+)
+from nerfstudio.model_components.renderers import AccumulationRenderer, DepthRenderer, NormalsRenderer, RGBRenderer
+from nerfstudio.model_components.scene_colliders import NearFarCollider
+from nerfstudio.model_components.shaders import NormalsShader
+from nerfstudio.models.base_model import Model, ModelConfig
+from typing import Any, Dict, List, Literal, Tuple, Type
+from nerfstudio.configs.config_utils import to_immutable_dict
+from nerfstudio.field_components.encodings import NeRFEncoding
+from nerfstudio.field_components.field_heads import FieldHeadNames
+from nerfstudio.field_components.temporal_distortions import TemporalDistortionKind
+from nerfstudio.fields.vanilla_nerf_field import NeRFField
+from nerfstudio.model_components.losses import MSELoss, scale_gradients_by_distance_squared
+from nerfstudio.model_components.ray_samplers import PDFSampler, UniformSampler
+from nerfstudio.model_components.renderers import AccumulationRenderer, DepthRenderer, RGBRenderer
+from nerfstudio.models.base_model import Model, ModelConfig
+
+
+
+
+
+@dataclass
+class SparseNerfConfig(ModelConfig):
+    """Additional parameters for depth supervision."""
+    _target: Type = field(default_factory=lambda: DepthNerfactoModel)
+    depth_loss_mult: float = 1e-3
+    """Lambda of the depth loss."""
+    is_euclidean_depth: bool = False
+    """Whether input depth maps are Euclidean distances (or z-distances)."""
+    depth_sigma: float = 0.01
+    """Uncertainty around depth values in meters (defaults to 1cm)."""
+    should_decay_sigma: bool = False
+    """Whether to exponentially decay sigma."""
+    starting_depth_sigma: float = 0.2
+    """Starting uncertainty around depth values in meters (defaults to 0.2m)."""
+    sigma_decay_rate: float = 0.99985
+    """Rate of exponential decay."""
+    depth_loss_type: DepthLossType = DepthLossType.DS_NERF
+    """Depth loss type."""
+
+    """Nerfacto Model Config"""
+
+    _target: Type = field(default_factory=lambda: NerfactoModel)
+    near_plane: float = 0.05
+    """How far along the ray to start sampling."""
+    far_plane: float = 1000.0
+    """How far along the ray to stop sampling."""
+    background_color: Literal["random", "last_sample", "black", "white"] = "last_sample"
+    """Whether to randomize the background color."""
+    hidden_dim: int = 64
+    """Dimension of hidden layers"""
+    hidden_dim_color: int = 64
+    """Dimension of hidden layers for color network"""
+    hidden_dim_transient: int = 64
+    """Dimension of hidden layers for transient network"""
+    num_levels: int = 16
+    """Number of levels of the hashmap for the base mlp."""
+    base_res: int = 16
+    """Resolution of the base grid for the hashgrid."""
+    max_res: int = 2048
+    """Maximum resolution of the hashmap for the base mlp."""
+    log2_hashmap_size: int = 19
+    """Size of the hashmap for the base mlp"""
+    features_per_level: int = 2
+    """How many hashgrid features per level"""
+    num_proposal_samples_per_ray: Tuple[int, ...] = (256, 96)
+    """Number of samples per ray for each proposal network."""
+    num_nerf_samples_per_ray: int = 48
+    """Number of samples per ray for the nerf network."""
+    proposal_update_every: int = 5
+    """Sample every n steps after the warmup"""
+    proposal_warmup: int = 5000
+    """Scales n from 1 to proposal_update_every over this many steps"""
+    num_proposal_iterations: int = 2
+    """Number of proposal network iterations."""
+    use_same_proposal_network: bool = False
+    """Use the same proposal network. Otherwise use different ones."""
+    proposal_net_args_list: List[Dict] = field(
+        default_factory=lambda: [
+            {"hidden_dim": 16, "log2_hashmap_size": 17, "num_levels": 5, "max_res": 128, "use_linear": False},
+            {"hidden_dim": 16, "log2_hashmap_size": 17, "num_levels": 5, "max_res": 256, "use_linear": False},
+        ]
+    )
+    """Arguments for the proposal density fields."""
+    proposal_initial_sampler: Literal["piecewise", "uniform"] = "piecewise"
+    """Initial sampler for the proposal network. Piecewise is preferred for unbounded scenes."""
+    interlevel_loss_mult: float = 1.0
+    """Proposal loss multiplier."""
+    distortion_loss_mult: float = 0.002
+    """Distortion loss multiplier."""
+    orientation_loss_mult: float = 0.0001
+    """Orientation loss multiplier on computed normals."""
+    pred_normal_loss_mult: float = 0.001
+    """Predicted normal loss multiplier."""
+    use_proposal_weight_anneal: bool = True
+    """Whether to use proposal weight annealing."""
+    use_appearance_embedding: bool = True
+    """Whether to use an appearance embedding."""
+    use_average_appearance_embedding: bool = True
+    """Whether to use average appearance embedding or zeros for inference."""
+    proposal_weights_anneal_slope: float = 10.0
+    """Slope of the annealing function for the proposal weights."""
+    proposal_weights_anneal_max_num_iters: int = 1000
+    """Max num iterations for the annealing function."""
+    use_single_jitter: bool = True
+    """Whether use single jitter or not for the proposal networks."""
+    predict_normals: bool = False
+    """Whether to predict normals or not."""
+    disable_scene_contraction: bool = False
+    """Whether to disable scene contraction or not."""
+    use_gradient_scaling: bool = False
+    """Use gradient scaler where the gradients are lower for points closer to the camera."""
+    implementation: Literal["tcnn", "torch"] = "tcnn"
+    """Which implementation to use for the model."""
+    appearance_embed_dim: int = 32
+    """Dimension of the appearance embedding."""
+    average_init_density: float = 1.0
+    """Average initial density output from MLP. """
+    camera_optimizer: CameraOptimizerConfig = field(default_factory=lambda: CameraOptimizerConfig(mode="SO3xR3"))
+    """Config of the camera optimizer to use"""
+
+    """Vanilla Model Config"""
+
+    _target: Type = field(default_factory=lambda: NeRFModel)
+    num_coarse_samples: int = 64
+    """Number of samples in coarse field evaluation"""
+    num_importance_samples: int = 128
+    """Number of samples in fine field evaluation"""
+
+    enable_temporal_distortion: bool = False
+    """Specifies whether or not to include ray warping based on time."""
+    temporal_distortion_params: Dict[str, Any] = to_immutable_dict({"kind": TemporalDistortionKind.DNERF})
+    """Parameters to instantiate temporal distortion with"""
+    use_gradient_scaling: bool = False
+    """Use gradient scaler where the gradients are lower for points closer to the camera."""
+    background_color: Literal["random", "last_sample", "black", "white"] = "white"
+    """Whether to randomize the background color."""
+
+
 
 
 class MipNerfModel(Model):
@@ -41,13 +196,13 @@ class MipNerfModel(Model):
         config: MipNerf configuration to instantiate model
     """
 
-    config: VanillaModelConfig
+    config: SparseNerfConfig
 
     # 类的初始化方法 __init__
     # 这个方法初始化模型，确认配置中包含必要的边界框碰撞参数。
     def __init__(
         self,
-        config: VanillaModelConfig,
+        config: SparseNerfConfig,
         **kwargs,
     ) -> None:
         self.field = None
@@ -150,6 +305,37 @@ class MipNerfModel(Model):
         }
         return outputs
 
+
+
+    def depth_loss(self, outputs, batch):
+        pred_depth = outputs["depth_fine"]
+        true_depth = batch["depth_image"]
+        depth = 
+
+
+        margin1 = 1e-4
+        margin2 = 1e-4
+        depth_loss0_0 = np.mean(np.maximum(depth[0,:]-depth[1,:]+margin1,0))
+        depth_loss0_1 = np.mean(np.maximum(np.abs(depth[0,:]-depth[2,:])-margin2,0)) 
+        depth_loss0_2 = np.mean(np.maximum(np.abs(depth[1,:]-depth[3,:])-margin2,0))
+
+        depth_loss = depth_loss0_0+(depth_loss0_1+depth_loss0_2)*0.01
+
+        return depth_loss
+
+
+    def patch_based_geometric_regularization(self, outputs, batch):
+        ps = 1024
+        depth = outputs["depth_fine"].view(-1, ps, ps, -1)
+
+        # 计算patch损失
+        dx = torch.abs(depth[:, :-1, :] - depth[:, 1:, :])
+        dy = torch.abs(depth[:, :, :-1] - depth[:, :, 1:])
+        tv_loss = (dx + dy).mean()
+
+        return tv_loss
+    
+
     # 根据渲染结果和真实图像计算损失，分为粗略和精细两个级别。
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
         image = batch["image"].to(self.device)
@@ -165,7 +351,9 @@ class MipNerfModel(Model):
         )
         rgb_loss_coarse = self.rgb_loss(image_coarse, pred_coarse)
         rgb_loss_fine = self.rgb_loss(image_fine, pred_fine)
-        loss_dict = {"rgb_loss_coarse": rgb_loss_coarse, "rgb_loss_fine": rgb_loss_fine}
+        depth_loss = self.depth_loss(self, outputs, batch)
+        tv_loss = self.patch_based_geometric_regularization(self, outputs, batch)
+        loss_dict = {"rgb_loss_coarse": rgb_loss_coarse, "rgb_loss_fine": rgb_loss_fine, "depth_loss": self.config.depth_loss_mult * depth_loss, "geometric_loss": tv_loss * self.config.depth_loss_mult}
         loss_dict = misc.scale_dict(loss_dict, self.config.loss_coefficients)
         return loss_dict
 
